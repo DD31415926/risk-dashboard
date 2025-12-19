@@ -29,8 +29,8 @@ import plotly.graph_objects as go
 # 0) 配置与路径
 # =========================================================
 # 请确保这两个文件在你的运行目录下，或者修改为绝对路径
-APP_PATH = "/home/yaolushen/fall_242A/242A_datasets/application_record.csv"
-CRED_PATH = "/home/yaolushen/fall_242A/242A_datasets/credit_record.csv"
+APP_PATH = "application_record.csv"
+CRED_PATH = "credit_record.csv"
 
 # 用于生产环境的配置
 TEST_SIZE = float(os.environ.get("TEST_SIZE", "0.30"))
@@ -520,3 +520,4 @@ def predict_simulator(n_clicks, values, ids, model_name, thr):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8050"))
     app.run_server(host="0.0.0.0", port=port, debug=True)
+
