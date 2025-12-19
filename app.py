@@ -27,8 +27,8 @@ import plotly.graph_objects as go
 # =========================================================
 # 0) 配置与路径
 # =========================================================
-APP_PATH  = "/home/yaolushen/fall_242A/242A_datasets/application_record.csv"
-CRED_PATH = "/home/yaolushen/fall_242A/242A_datasets/credit_record.csv"
+APP_PATH  = "application_record.csv"
+CRED_PATH = "credit_record.csv"
 
 TEST_SIZE = 0.3
 RANDOM_STATE = 42
@@ -468,5 +468,6 @@ def run_prediction(n, values, ids, model_name, thr):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8050"))
     app.run_server(host="0.0.0.0", port=port, debug=True)
+
 
 
