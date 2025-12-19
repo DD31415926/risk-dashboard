@@ -1,6 +1,5 @@
 import os
 import warnings
-
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -28,71 +27,85 @@ import plotly.graph_objects as go
 # =========================================================
 # 0) 配置与路径
 # =========================================================
-# 请确保这两个文件在你的运行目录下，或者修改为绝对路径
-APP_PATH = "application_record.csv"
-CRED_PATH = "credit_record.csv"
+APP_PATH  = "/home/yaolushen/fall_242A/242A_datasets/application_record.csv"
+CRED_PATH = "/home/yaolushen/fall_242A/242A_datasets/credit_record.csv"
 
-# 用于生产环境的配置
-TEST_SIZE = float(os.environ.get("TEST_SIZE", "0.30"))
-RANDOM_STATE = int(os.environ.get("RANDOM_STATE", "42"))
+TEST_SIZE = 0.3
+RANDOM_STATE = 42
 
-# Basic Auth 配置
+# Basic Auth
 AUTH_USER = os.environ.get("DASH_AUTH_USER")
 AUTH_PASS = os.environ.get("DASH_AUTH_PASS")
 
-
-# =========================================================
-# 1) 工具函数：Basic Auth & T-test
-# =========================================================
 def add_basic_auth(server, username, password):
-    if not username or not password:
-        return
+    if not username or not password: return
     from flask import request, Response
     @server.before_request
     def _basic_auth():
         auth = request.authorization
-        ok = (auth is not None and auth.username == username and auth.password == password)
-        if ok: return None
+        if auth and auth.username == username and auth.password == password: return None
         return Response("Authentication required", 401, {"WWW-Authenticate": 'Basic realm="Login Required"'})
 
+# =========================================================
+# 1) 核心特征工程逻辑 (这也是连接原始输入和模型的桥梁)
+# =========================================================
+def engineer_features(df_in):
+    """
+    接收包含原始列(AMT_INCOME_TOTAL, FLAG_OWN_CAR等)的DataFrame,
+    返回包含模型所需特征(Asset_Score, Age_Clean等)的DataFrame。
+    """
+    df = df_in.copy()
+    
+    # 1. 资产分数 (Asset Score)
+    # 兼容处理：如果是预测输入，可能是字面量；如果是原始读取，可能是Y/N
+    if "FLAG_OWN_CAR" in df.columns and "FLAG_OWN_REALTY" in df.columns:
+        has_car = df["FLAG_OWN_CAR"].astype(str).str.upper().replace({'Y': 1, 'N': 0, 'YES': 1, 'NO': 0})
+        has_realty = df["FLAG_OWN_REALTY"].astype(str).str.upper().replace({'Y': 1, 'N': 0, 'YES': 1, 'NO': 0})
+        # 强制转为numeric，无法转换的设为0
+        has_car = pd.to_numeric(has_car, errors='coerce').fillna(0)
+        has_realty = pd.to_numeric(has_realty, errors='coerce').fillna(0)
+        df["Asset_Score"] = has_car + has_realty
+    
+    # 2. 年龄处理 (Age Clean)
+    # 如果输入的是原始 DAYS_BIRTH (负数天数)
+    if "DAYS_BIRTH" in df.columns:
+        # 确保是数值
+        d_birth = pd.to_numeric(df["DAYS_BIRTH"], errors='coerce')
+        # 如果是负数（原始数据），转为正年；如果是正数（可能是用户直接填了年龄），保持不变
+        df["Age_Clean"] = d_birth.apply(lambda x: abs(x)/365.25 if x < 0 else x)
+    
+    # 3. 工作年限 (Days Employed)
+    if "DAYS_EMPLOYED" in df.columns:
+        d_emp = pd.to_numeric(df["DAYS_EMPLOYED"], errors='coerce')
+        # 365243 是原始数据中的异常值代表退休/无工作
+        df["DAYS_EMPLOYED_CLEAN"] = d_emp.apply(lambda x: 0 if x > 0 else abs(x)/365.25)
 
-def ttest_pvalue(x, y_series):
-    g0 = x[y_series == 0]
-    g1 = x[y_series == 1]
-    if pd.Series(x).nunique(dropna=True) <= 1:
-        return np.nan
-    try:
-        _, p = stats.ttest_ind(g0, g1, equal_var=False, nan_policy="omit")
-        return float(p)
-    except Exception:
-        return np.nan
+    # 4. 家庭收入效率 (Income Efficiency)
+    cols = ["AMT_INCOME_TOTAL", "CNT_FAM_MEMBERS", "CNT_CHILDREN"]
+    if set(cols).issubset(df.columns):
+        inc = pd.to_numeric(df["AMT_INCOME_TOTAL"], errors='coerce')
+        fam = pd.to_numeric(df["CNT_FAM_MEMBERS"], errors='coerce')
+        child = pd.to_numeric(df["CNT_CHILDREN"], errors='coerce')
+        denom = (fam - child).clip(lower=1) # 避免除以0
+        df["Adult_Income_Efficiency"] = inc / denom
 
+    return df
 
 # =========================================================
-# 2) 数据处理流水线 (Data Loading & Engineering)
+# 2) 数据加载与预处理
 # =========================================================
-print("Loading and Processing Data... This may take a moment.")
-
-# --- Step A: 读取原始数据 ---
-if not os.path.exists(APP_PATH) or not os.path.exists(CRED_PATH):
-    raise FileNotFoundError(f"Data files not found. Ensure {APP_PATH} and {CRED_PATH} exist.")
-
+print("Loading Data...")
 app_df = pd.read_csv(APP_PATH)
 cred_df = pd.read_csv(CRED_PATH)
 
-# --- Step B: 定义标签 (Labeling) ---
+# --- 2.1 标签定义 (Labeling) ---
 WINDOW = 12
-FULL_LEN = WINDOW + 1
 BAD_SET = {"1", "2", "3", "4", "5"}
 
-w = cred_df[
-    (cred_df["MONTHS_BALANCE"] >= -WINDOW) &
-    (cred_df["MONTHS_BALANCE"] <= 0)
-    ].copy()
-
+w = cred_df[(cred_df["MONTHS_BALANCE"] >= -WINDOW) & (cred_df["MONTHS_BALANCE"] <= 0)].copy()
 months_in_window = w.groupby("ID")["MONTHS_BALANCE"].nunique()
 ever_bad = w.groupby("ID")["STATUS"].apply(lambda s: s.isin(BAD_SET).any())
-ever_c = w.groupby("ID")["STATUS"].apply(lambda s: (s == "C").any())
+ever_c   = w.groupby("ID")["STATUS"].apply(lambda s: (s == "C").any())
 
 lab = pd.DataFrame({
     "ID": months_in_window.index,
@@ -100,423 +113,300 @@ lab = pd.DataFrame({
     "ever_bad": ever_bad.reindex(months_in_window.index).values,
     "ever_c": ever_c.reindex(months_in_window.index).values,
 })
-
 lab["label"] = np.nan
-full = lab["months_in_window"] >= FULL_LEN
+full = lab["months_in_window"] >= (WINDOW + 1)
 lab.loc[full & (lab["ever_bad"]), "label"] = 1
 lab.loc[full & (~lab["ever_bad"]) & (lab["ever_c"]), "label"] = 0
+labels = lab[["ID", "label"]].dropna().copy().astype(int)
 
-labels = lab[["ID", "label"]].dropna().copy()
-labels["label"] = labels["label"].astype(int)
+# --- 2.2 合并数据 ---
+# 只做 Inner Join，防止无标签数据混入
+merged_df = app_df.merge(labels, on="ID", how="inner")
 
-# 合并标签
-final_df = app_df.merge(labels, on="ID", how="inner").copy()
+# --- 2.3 补充 Credit 表中的特征 (Account Age) ---
+# 这些特征必须保留，因为它们对模型很重要。
+# 在预测器中，我们需要让用户手动输入这些值（模拟查询信用局）
+acct_stats = cred_df.groupby("ID")["MONTHS_BALANCE"].agg(["min", "count"]).reset_index()
+acct_stats["Account_Age_Months"] = acct_stats["min"].abs()
+acct_stats["Active_Months"] = acct_stats["count"]
+merged_df = merged_df.merge(acct_stats[["ID", "Account_Age_Months", "Active_Months"]], on="ID", how="left")
 
-# --- Step C: 手动特征工程 (Manual Feature Engineering) ---
-# 1. Account Age (Credit History)
-account_age = cred_df.groupby("ID")["MONTHS_BALANCE"].agg(["min", "count"]).reset_index()
-account_age["Account_Age_Months"] = account_age["min"].abs()
-account_age["Active_Months"] = account_age["count"]
-final_df = final_df.merge(account_age[["ID", "Account_Age_Months", "Active_Months"]], on="ID", how="left")
+# --- 2.4 应用特征工程 ---
+# 这里生成模型真正用到的列 (Age_Clean, Asset_Score 等)
+model_ready_df = engineer_features(merged_df)
 
-# 2. Employment
-if "DAYS_EMPLOYED" in final_df.columns:
-    final_df["DAYS_EMPLOYED_CLEAN"] = final_df["DAYS_EMPLOYED"].apply(
-        lambda x: 0 if pd.notna(x) and x > 0 else (abs(x) / 365.25 if pd.notna(x) else np.nan)
-    )
+# 定义需要丢弃的原始列（因为已经转化为了新特征，避免多重共线性）
+# 注意：我们保留原始列用于 Dashboard 的 Dropdown 选项读取，但在进入 X 之前丢弃
+DROP_FOR_TRAIN = [
+    "ID", "label", 
+    "DAYS_BIRTH", "DAYS_EMPLOYED", 
+    "FLAG_OWN_CAR", "FLAG_OWN_REALTY", 
+    "FLAG_MOBIL", "FLAG_WORK_PHONE", "FLAG_PHONE", "FLAG_EMAIL"
+]
 
-# 3. Age
-if "DAYS_BIRTH" in final_df.columns:
-    final_df["Age_Clean"] = final_df["DAYS_BIRTH"].abs() / 365.25
-
-# 4. Asset Score
-if "FLAG_OWN_CAR" in final_df.columns and "FLAG_OWN_REALTY" in final_df.columns:
-    final_df["Asset_Score"] = (final_df["FLAG_OWN_CAR"].astype(str) == "Y").astype(int) + \
-                              (final_df["FLAG_OWN_REALTY"].astype(str) == "Y").astype(int)
-
-# 5. Income Efficiency
-if {"AMT_INCOME_TOTAL", "CNT_FAM_MEMBERS", "CNT_CHILDREN"}.issubset(final_df.columns):
-    denom = (final_df["CNT_FAM_MEMBERS"] - final_df["CNT_CHILDREN"]).clip(lower=1)
-    final_df["Adult_Income_Efficiency"] = final_df["AMT_INCOME_TOTAL"] / denom
-
-# --- Step D: 清理不需要的原始列以避免共线性 ---
-# 我们保留 engineered features，丢弃原始的 DAYS_BIRTH 等，以免模型混淆
-cols_to_drop = ["ID", "label", "DAYS_BIRTH", "DAYS_EMPLOYED", "FLAG_OWN_CAR", "FLAG_OWN_REALTY", "FLAG_MOBIL",
-                "FLAG_WORK_PHONE", "FLAG_PHONE", "FLAG_EMAIL"]
-# 注意：保留 AMT_INCOME_TOTAL 等基础数值列，因为它们本身也是特征
-
-y = final_df["label"].astype(int)
-X = final_df.drop(columns=[c for c in cols_to_drop if c in final_df.columns], errors="ignore")
+y = model_ready_df["label"]
+X = model_ready_df.drop(columns=[c for c in DROP_FOR_TRAIN if c in model_ready_df.columns], errors="ignore")
 
 # =========================================================
-# 3) 数据切分与多项式流水线
+# 3) 模型训练流水线
 # =========================================================
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
 )
 
-# 列定义
+# 自动识别列类型
 cat_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()
 num_all = X.select_dtypes(include=[np.number]).columns.tolist()
-num_bin = [c for c in num_all if X[c].nunique(dropna=True) <= 2]
-num_poly_base = [c for c in num_all if X[c].nunique(dropna=True) > 2]
+num_bin = [c for c in num_all if X[c].nunique() <= 2]
+num_poly_base = [c for c in num_all if X[c].nunique() > 2]
 
-# 为 Dashboard 准备下拉选项
-cat_options = {col: sorted([str(x) for x in X[col].dropna().unique()]) for col in cat_cols}
-
-# Pipeline 定义
-poly = PolynomialFeatures(degree=2, include_bias=False)
-
+# 预处理 Pipeline
 preprocess = ColumnTransformer(
     transformers=[
-        ("cat", Pipeline(steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
-        ]), cat_cols),
-        ("num_bin", Pipeline(steps=[
-            ("imputer", SimpleImputer(strategy="median"))
-        ]), num_bin),
-        ("num_poly", Pipeline(steps=[
-            ("imputer", SimpleImputer(strategy="median")),
-            ("poly", poly),
-        ]), num_poly_base),
+        ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False))]), cat_cols),
+        ("num_bin", Pipeline([("imp", SimpleImputer(strategy="median"))]), num_bin),
+        ("num_poly", Pipeline([("imp", SimpleImputer(strategy="median")), ("poly", PolynomialFeatures(degree=2, include_bias=False))]), num_poly_base),
     ],
     remainder="drop",
     verbose_feature_names_out=False
 ).set_output(transform="pandas")
 
-# Fit & Transform
-print("Running Pipeline and Poly features...")
+print("Transforming features...")
 Z_train = preprocess.fit_transform(X_train)
 Z_test = preprocess.transform(X_test)
 
-# 去除交互项 (Interaction Terms)，只保留 x 和 x^2
+# 去除交互项 + T-test 筛选
 poly_cols_all = [c for c in Z_train.columns if any(base in c for base in num_poly_base)]
-poly_no_inter_cols = [c for c in poly_cols_all if (" " not in c)]  # 简单规则：无空格即为纯项(如 x0^2)
+poly_pure_cols = [c for c in poly_cols_all if " " not in c] # 只留 x^2, 去掉 x y
 non_poly_cols = [c for c in Z_train.columns if c not in poly_cols_all]
 
-Z_train2 = pd.concat([Z_train[non_poly_cols], Z_train[poly_no_inter_cols]], axis=1)
-Z_test2 = pd.concat([Z_test[non_poly_cols], Z_test[poly_no_inter_cols]], axis=1)
+Z_train_sel = pd.concat([Z_train[non_poly_cols], Z_train[poly_pure_cols]], axis=1)
+Z_test_sel = pd.concat([Z_test[non_poly_cols], Z_test[poly_pure_cols]], axis=1)
 
-# T-test 特征筛选
-print("Performing T-test selection...")
-pvals = [(c, ttest_pvalue(Z_train2[c], y_train)) for c in poly_no_inter_cols]
-pvals_df = pd.DataFrame(pvals, columns=["feature", "p_value"]).sort_values("p_value")
-sig_poly = pvals_df[(pvals_df["p_value"].notna()) & (pvals_df["p_value"] < 0.05)]["feature"].tolist()
+# T-test
+def ttest_pvalue(x, y):
+    try: return stats.ttest_ind(x[y==0], x[y==1], equal_var=False, nan_policy="omit")[1]
+    except: return np.nan
 
-# 兜底策略
-if len(sig_poly) == 0:
-    sig_poly = pvals_df.dropna().head(20)["feature"].tolist()
+pvals = [(c, ttest_pvalue(Z_train_sel[c], y_train)) for c in poly_pure_cols]
+sig_poly = [c for c, p in pvals if p < 0.05]
+if not sig_poly: sig_poly = [c for c, p in sorted(pvals, key=lambda x: x[1] if pd.notna(x[1]) else 1)[:20]]
 
 final_cols = non_poly_cols + sig_poly
+X_train_final = Z_train_sel[final_cols]
+X_test_final = Z_test_sel[final_cols]
 
-X_train_final = Z_train2[final_cols]
-X_test_final = Z_test2[final_cols]
+print(f"Training Models with {len(final_cols)} features...")
 
-print(f"Final feature count: {X_train_final.shape[1]}")
-
-# =========================================================
-# 4) 模型训练 (LR & RF)
-# =========================================================
-# --- Logistic Regression ---
+# --- 训练 Logistic Regression ---
 scaler = StandardScaler(with_mean=False)
 Xtr_sc = scaler.fit_transform(X_train_final)
 Xte_sc = scaler.transform(X_test_final)
+lr_model = LogisticRegression(max_iter=3000, class_weight="balanced", solver="lbfgs")
+lr_model.fit(Xtr_sc, y_train)
+p_lr = lr_model.predict_proba(Xte_sc)[:, 1]
 
-print("Training Logistic Regression...")
-final_logit = LogisticRegression(max_iter=5000, class_weight="balanced", solver="lbfgs")
-final_logit.fit(Xtr_sc, y_train)
-
-p_lr = final_logit.predict_proba(Xte_sc)[:, 1]
-auc_lr = roc_auc_score(y_test, p_lr)
-ap_lr = average_precision_score(y_test, p_lr)
-
-# --- Random Forest (补充部分) ---
-print("Training Random Forest...")
-final_rf = RandomForestClassifier(
-    n_estimators=300,  # 适度树数量
-    max_depth=10,  # 限制深度防止过拟合
-    min_samples_leaf=5,  # 增加叶子节点样本数要求
-    random_state=RANDOM_STATE,
-    class_weight="balanced",
-    n_jobs=-1
+# --- 训练 Random Forest (新增部分) ---
+rf_model = RandomForestClassifier(
+    n_estimators=300, max_depth=10, min_samples_leaf=5, 
+    random_state=RANDOM_STATE, class_weight="balanced", n_jobs=-1
 )
-# RF 不需要 Scaling，直接用筛选后的特征
-final_rf.fit(X_train_final, y_train)
+rf_model.fit(X_train_final, y_train)
+p_rf = rf_model.predict_proba(X_test_final)[:, 1]
 
-p_rf = final_rf.predict_proba(X_test_final)[:, 1]
-auc_rf = roc_auc_score(y_test, p_rf)
-ap_rf = average_precision_score(y_test, p_rf)
-
-# 存储结果供 Dashboard 调用
+# 结果存储
 store = {
-    "Logistic Regression": {"y_true": y_test.values, "y_proba": p_lr, "auc": auc_lr, "ap": ap_lr},
-    "Random Forest": {"y_true": y_test.values, "y_proba": p_rf, "auc": auc_rf, "ap": ap_rf},
+    "Logistic Regression": {"y": y_test, "p": p_lr, "auc": roc_auc_score(y_test, p_lr)},
+    "Random Forest":       {"y": y_test, "p": p_rf, "auc": roc_auc_score(y_test, p_rf)}
 }
 
-# 提取 Feature Importance
-rf_importance = (
-    pd.DataFrame({"feature": X_train_final.columns, "importance": final_rf.feature_importances_})
-    .sort_values("importance", ascending=False)
-)
-# 格式化表格数据
-stats_df = pd.DataFrame([{
-    "Feature": f,
-    "Importance": f"{imp:.4f}"
-} for f, imp in zip(rf_importance["feature"], rf_importance["importance"])])
-
+# RF Feature Importance
+rf_imp = pd.DataFrame({"Feature": X_train_final.columns, "Importance": rf_model.feature_importances_}).sort_values("Importance", ascending=False)
 
 # =========================================================
-# 5) Dash UI 构建
+# 4) Dashboard 定义 (使用原始 Application Columns)
 # =========================================================
-def build_input_fields(columns, cat_cols, cat_opts):
-    fields, row = [], []
-    # 简单的排序，把数值和类别分开
-    sorted_cols = sorted(columns)
-
-    for col in sorted_cols:
-        if col in cat_cols:
-            input_comp = dcc.Dropdown(
-                id={'type': 'pred-input', 'index': col},
-                options=[{'label': str(v), 'value': v} for v in cat_opts.get(col, [])],
-                placeholder=f"Select {col}",
-                style={"fontSize": "13px"}
-            )
-        else:
-            input_comp = dcc.Input(
-                id={'type': 'pred-input', 'index': col},
-                type="number",
-                placeholder=col,
-                debounce=True,
-                style={"width": "100%", "padding": "6px", "boxSizing": "border-box"}
-            )
-
-        row.append(html.Div([
-            html.Label(col,
-                       style={"fontWeight": "bold", "fontSize": "12px", "display": "block", "marginBottom": "5px"}),
-            input_comp
-        ], style={"width": "30%", "display": "inline-block", "marginRight": "3%", "marginBottom": "15px",
-                  "verticalAlign": "top"}))
-
-        if len(row) == 3:
-            fields.append(html.Div(row))
-            row = []
-    if row:
-        fields.append(html.Div(row))
-    return fields
-
-
 app = dash.Dash(__name__)
 server = app.server
 add_basic_auth(server, AUTH_USER, AUTH_PASS)
+app.title = "Risk Prediction Dashboard"
 
-app.title = "Credit Risk Dashboard"
+# 定义 Dashboard 输入字段 (这是为了让用户看原始字段名)
+# 我们将从原始 app_df 中提取选项
+raw_cat_cols = ["CODE_GENDER", "FLAG_OWN_CAR", "FLAG_OWN_REALTY", "NAME_INCOME_TYPE", 
+                "NAME_EDUCATION_TYPE", "NAME_FAMILY_STATUS", "NAME_HOUSING_TYPE", "OCCUPATION_TYPE"]
+raw_num_cols = ["AMT_INCOME_TOTAL", "CNT_CHILDREN", "CNT_FAM_MEMBERS", "DAYS_BIRTH", "Account_Age_Months", "Active_Months"]
 
-# 使用 X.columns 构建输入框 (包含 engineered features 如 Age_Clean)
-# 这是折中方案：用户直接输入 "Clean Age" 比输入 "Birth Date" 更符合模型逻辑，且不需要复杂的交互转换
-input_fields_layout = build_input_fields(X.columns, cat_cols, cat_options)
+# 提取选项
+options_map = {c: sorted([str(x) for x in app_df[c].dropna().unique()]) for c in raw_cat_cols if c in app_df.columns}
+
+# 手动添加 Y/N 选项以防数据中缺失
+options_map["FLAG_OWN_CAR"] = ["Y", "N"]
+options_map["FLAG_OWN_REALTY"] = ["Y", "N"]
+
+def generate_inputs():
+    inputs = []
+    
+    # 1. Categorical Inputs
+    inputs.append(html.H4("Personal Info (Categorical)", style={"marginTop": "20px"}))
+    row = []
+    for c in raw_cat_cols:
+        if c not in options_map: continue
+        comp = html.Div([
+            html.Label(c, style={"fontWeight": "bold", "fontSize": "12px"}),
+            dcc.Dropdown(id={'type': 'in', 'index': c}, options=[{'label': i, 'value': i} for i in options_map[c]], placeholder="Select...", style={"fontSize": "13px"})
+        ], style={"width": "23%", "display": "inline-block", "marginRight": "2%", "marginBottom": "10px"})
+        row.append(comp)
+    inputs.append(html.Div(row))
+
+    # 2. Numerical Inputs
+    inputs.append(html.H4("Financial & Stats (Numeric)", style={"marginTop": "20px"}))
+    row = []
+    
+    # 特殊处理：DAYS_BIRTH
+    row.append(html.Div([
+        html.Label("AGE (Years)", style={"fontWeight": "bold", "fontSize": "12px"}), # UI显示年龄
+        dcc.Input(id={'type': 'in', 'index': 'DAYS_BIRTH'}, type="number", placeholder="e.g. 35", style={"width": "100%", "padding": "6px"})
+    ], style={"width": "23%", "display": "inline-block", "marginRight": "2%"}))
+
+    # 其他数值
+    for c in ["AMT_INCOME_TOTAL", "CNT_CHILDREN", "CNT_FAM_MEMBERS"]:
+        row.append(html.Div([
+            html.Label(c, style={"fontWeight": "bold", "fontSize": "12px"}),
+            dcc.Input(id={'type': 'in', 'index': c}, type="number", placeholder="0", style={"width": "100%", "padding": "6px"})
+        ], style={"width": "23%", "display": "inline-block", "marginRight": "2%"}))
+    inputs.append(html.Div(row))
+
+    # 3. Credit History (Required Inputs)
+    inputs.append(html.H4("Credit Bureau Data (Simulated)", style={"marginTop": "20px"}))
+    row = []
+    for c in ["Account_Age_Months", "Active_Months"]:
+        row.append(html.Div([
+            html.Label(c, style={"fontWeight": "bold", "fontSize": "12px"}),
+            dcc.Input(id={'type': 'in', 'index': c}, type="number", value=12, style={"width": "100%", "padding": "6px"})
+        ], style={"width": "23%", "display": "inline-block", "marginRight": "2%"}))
+    inputs.append(html.Div(row))
+    
+    return inputs
 
 app.layout = html.Div([
-    html.H2("Credit Risk Dashboard: End-to-End Pipeline",
-            style={"borderBottom": "2px solid #333", "paddingBottom": "10px"}),
-
-    # 控制栏
+    html.H2("Credit Risk Predictor: Raw Data Input"),
+    
     html.Div([
-        html.Div([
-            html.Label("Select Model", style={"fontWeight": "bold"}),
-            dcc.Dropdown(
-                id="model_name",
-                options=[{"label": k, "value": k} for k in store.keys()],
-                value="Random Forest",
-                clearable=False
-            )
-        ], style={"width": "25%", "display": "inline-block"}),
-
-        html.Div([
-            html.Label("Decision Threshold", style={"fontWeight": "bold"}),
-            dcc.Slider(id="threshold", min=0, max=1, step=0.01, value=0.5,
-                       marks={0: "0", 0.5: "0.5", 1: "1"})
-        ], style={"width": "60%", "display": "inline-block", "marginLeft": "5%", "verticalAlign": "top"})
-    ], style={"padding": "20px", "backgroundColor": "#f1f3f4", "borderRadius": "5px", "marginBottom": "25px"}),
+        html.Label("Select Model:"),
+        dcc.Dropdown(id="model_sel", options=[{"label": k, "value": k} for k in store.keys()], value="Random Forest", clearable=False, style={"width": "300px"})
+    ], style={"marginBottom": "20px"}),
 
     dcc.Tabs([
-        # Tab 1: 模型评估
-        dcc.Tab(label="Model Evaluation", children=[
+        dcc.Tab(label="Model Performance", children=[
             html.Div([
-                # 左侧：混淆矩阵 + 指标
-                html.Div([
-                    dcc.Graph(id="conf_matrix"),
-                    html.Div(id="metrics_text",
-                             style={"padding": "15px", "border": "1px solid #ddd", "borderRadius": "5px",
-                                    "backgroundColor": "white", "marginTop": "10px"})
-                ], style={"width": "38%", "display": "inline-block", "verticalAlign": "top"}),
-
-                # 右侧：ROC & PR 曲线
-                html.Div([
-                    dcc.Graph(id="roc_curve"),
-                    dcc.Graph(id="pr_curve")
-                ], style={"width": "58%", "display": "inline-block", "marginLeft": "2%"})
-            ], style={"padding": "20px"}),
-
-            # Feature Importance (仅 RF 展示)
-            html.Div(id="feat_imp_wrapper", children=[
-                html.H4("Feature Importance (Top 20 - Random Forest Only)", style={"marginTop": "30px"}),
+                dcc.Graph(id="roc_graph", style={"width": "48%", "display": "inline-block"}),
+                dcc.Graph(id="conf_matrix", style={"width": "48%", "display": "inline-block"}),
+            ]),
+            html.Div(id="imp_container", children=[
+                html.H4("Random Forest Feature Importance"),
                 dash_table.DataTable(
-                    id="feat_imp_table",
-                    data=stats_df.head(20).to_dict("records"),
-                    columns=[{"name": i, "id": i} for i in stats_df.columns],
-                    page_size=10,
-                    style_header={'backgroundColor': 'rgb(230, 230, 230)', 'fontWeight': 'bold'},
-                    style_cell={"textAlign": "left", "padding": "10px"}
+                    data=rf_imp.head(15).to_dict("records"),
+                    columns=[{"name": i, "id": i} for i in rf_imp.columns],
+                    style_cell={"textAlign": "left"},
+                    page_size=10
                 )
-            ], style={"padding": "20px"})
+            ])
         ]),
-
-        # Tab 2: 模拟预测
-        dcc.Tab(label="Prediction Simulator", children=[
-            html.Div([
-                html.H4("Input Features"),
-                html.P(
-                    "Enter values for the features below. Note: 'Age_Clean' is age in years. 'Account_Age_Months' is history length.",
-                    style={"color": "#666", "fontSize": "14px"}),
-
-                html.Div(id="input_container", children=input_fields_layout, style={"marginTop": "20px"}),
-
-                html.Button("Predict Risk Score", id="btn_predict", n_clicks=0,
-                            style={"fontSize": "16px", "marginTop": "20px", "padding": "12px 24px",
-                                   "backgroundColor": "#28a745", "color": "white", "border": "none",
-                                   "borderRadius": "4px", "cursor": "pointer"}),
-                html.Hr(),
-                html.Div(id="prediction_output",
-                         style={"fontSize": "22px", "fontWeight": "bold", "padding": "15px", "minHeight": "60px"})
-            ], style={"padding": "30px", "maxWidth": "1000px", "margin": "0 auto"})
+        dcc.Tab(label="Prediction Simulator (Raw Data)", children=[
+            html.Div(generate_inputs(), style={"padding": "20px", "backgroundColor": "#f9f9f9"}),
+            html.Button("Predict Risk", id="btn_run", n_clicks=0, style={"marginTop": "20px", "fontSize": "18px", "padding": "10px 20px", "backgroundColor": "#007bff", "color": "white"}),
+            html.Div(id="pred_result", style={"marginTop": "20px", "fontSize": "24px", "fontWeight": "bold"})
         ])
     ])
-], style={"maxWidth": "1280px", "margin": "0 auto", "fontFamily": "Segoe UI, Arial, sans-serif"})
-
+], style={"maxWidth": "1200px", "margin": "0 auto", "fontFamily": "Arial"})
 
 # =========================================================
-# 6) Callbacks
+# 5) Callbacks
 # =========================================================
 
-def compute_metrics(y_true, y_proba, thr):
-    y_pred = (y_proba >= thr).astype(int)
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-    prec = tp / (tp + fp) if (tp + fp) else 0
-    rec = tp / (tp + fn) if (tp + fn) else 0
-    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0
-    acc = (tp + tn) / len(y_true)
-    return tn, fp, fn, tp, prec, rec, f1, acc
-
-
+# A. 更新图表
 @app.callback(
-    [Output("conf_matrix", "figure"),
-     Output("metrics_text", "children"),
-     Output("roc_curve", "figure"),
-     Output("pr_curve", "figure"),
-     Output("feat_imp_wrapper", "style")],  # 控制表格显示/隐藏
-    [Input("model_name", "value"),
-     Input("threshold", "value")]
+    [Output("roc_graph", "figure"), Output("conf_matrix", "figure"), Output("imp_container", "style")],
+    Input("model_sel", "value")
 )
-def update_eval(model_name, thr):
+def update_charts(model_name):
     d = store[model_name]
-    thr = float(thr)
+    fpr, tpr, _ = roc_curve(d["y"], d["p"])
+    
+    fig_roc = go.Figure(go.Scatter(x=fpr, y=tpr, fill='tozeroy'))
+    fig_roc.update_layout(title=f"ROC Curve (AUC={d['auc']:.3f})", xaxis_title="FPR", yaxis_title="TPR")
+    
+    # 简单的混淆矩阵 (Threshold 0.5)
+    cm = confusion_matrix(d["y"], (d["p"]>=0.5).astype(int))
+    fig_cm = px.imshow(cm, text_auto=True, title=f"Confusion Matrix ({model_name})", labels=dict(x="Pred", y="True"))
+    
+    # 控制 Feature Importance 显示
+    style = {"display": "block"} if model_name == "Random Forest" else {"display": "none"}
+    
+    return fig_roc, fig_cm, style
 
-    tn, fp, fn, tp, prec, rec, f1, acc = compute_metrics(d["y_true"], d["y_proba"], thr)
-
-    # 1. Confusion Matrix
-    cm = [[tn, fp], [fn, tp]]
-    fig_cm = px.imshow(cm, text_auto=True, x=["Pred 0 (Safe)", "Pred 1 (Risk)"], y=["True 0", "True 1"],
-                       color_continuous_scale="Blues",
-                       title=f"Confusion Matrix ({model_name})")
-    fig_cm.update_layout(coloraxis_showscale=False)
-
-    # 2. Metrics Text
-    txt = [
-        html.Div([html.Span("Accuracy: ", style={"fontWeight": "bold"}), f"{acc:.2%}"]),
-        html.Div([html.Span("Precision: ", style={"fontWeight": "bold"}), f"{prec:.2%}"]),
-        html.Div([html.Span("Recall: ", style={"fontWeight": "bold"}), f"{rec:.2%}"]),
-        html.Div([html.Span("F1 Score: ", style={"fontWeight": "bold"}), f"{f1:.3f}"]),
-        html.Br(),
-        html.Div([html.Span("ROC AUC: ", style={"fontWeight": "bold"}), f"{d['auc']:.3f}"]),
-        html.Div([html.Span("Avg Precision: ", style={"fontWeight": "bold"}), f"{d['ap']:.3f}"])
-    ]
-
-    # 3. ROC Curve
-    fpr, tpr, _ = roc_curve(d["y_true"], d["y_proba"])
-    fig_roc = go.Figure(go.Scatter(x=fpr, y=tpr, name="Model", line=dict(width=3, color="#007bff")))
-    fig_roc.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(dash="dash", color="gray"))
-    fig_roc.update_layout(title="ROC Curve", xaxis_title="False Positive Rate", yaxis_title="True Positive Rate",
-                          height=320, margin=dict(t=40, b=20, l=40, r=20))
-
-    # 4. PR Curve
-    p_arr, r_arr, _ = precision_recall_curve(d["y_true"], d["y_proba"])
-    fig_pr = go.Figure(go.Scatter(x=r_arr, y=p_arr, name="Model", line=dict(width=3, color="#28a745")))
-    fig_pr.update_layout(title="Precision-Recall Curve", xaxis_title="Recall", yaxis_title="Precision",
-                         height=320, margin=dict(t=40, b=20, l=40, r=20))
-
-    # 5. Hide Importance Table if LR
-    table_style = {"display": "block", "padding": "20px"}
-    if model_name == "Logistic Regression":
-        table_style = {"display": "none"}
-
-    return fig_cm, txt, fig_roc, fig_pr, table_style
-
-
+# B. 处理预测 (核心逻辑)
 @app.callback(
-    Output("prediction_output", "children"),
-    Input("btn_predict", "n_clicks"),
-    State({"type": "pred-input", "index": ALL}, "value"),
-    State({"type": "pred-input", "index": ALL}, "id"),
-    State("model_name", "value"),
-    State("threshold", "value"),
+    Output("pred_result", "children"),
+    Input("btn_run", "n_clicks"),
+    State({'type': 'in', 'index': ALL}, 'value'),
+    State({'type': 'in', 'index': ALL}, 'id'),
+    State("model_sel", "value"),
     prevent_initial_call=True
 )
-def predict_simulator(n_clicks, values, ids, model_name, thr):
-    if not values or all(v is None for v in values):
-        return html.Div("Please enter feature values.", style={"color": "gray"})
+def run_prediction(n, values, ids, model_name):
+    # 1. 收集原始输入
+    raw_data = {item['index']: val for val, item in zip(values, ids)}
+    df_raw = pd.DataFrame([raw_data])
+    
+    # 简单校验
+    if df_raw.isnull().all().all():
+        return "Please input data."
 
-    # 组装输入 DataFrame
-    row_dict = {comp_id["index"]: val for val, comp_id in zip(values, ids)}
-    input_df = pd.DataFrame([row_dict])
-
-    # 填补空值防止报错
-    input_df.fillna(0, inplace=True)
-
+    # 处理特殊输入：用户输入的 Age (e.g., 30) 需要视为 DAYS_BIRTH
+    # 在 engineer_features 中通过负数判断，这里为了兼容，我们把用户输入的正数转为负数？
+    # 不，我在 engineer_features 里写了逻辑： "如果是正数，保持不变"。
+    # 但是 DAYS_BIRTH 原始是负数。为了保持模型一致性，最好我们在 engineer_features 内部统一处理。
+    # 修正逻辑：Dashboard 传入 Age=30，engineer_features 看到正数30，直接用作 Age_Clean=30 即可。
+    # 因为 engineer_features 里写的是: if x < 0 abs(x)... else x. 
+    # 所以只要输入的是正数年龄，逻辑是通的。
+    
     try:
-        # 1. 预处理 (Pipeline: Impute -> OneHot -> Poly)
-        Z_input = preprocess.transform(input_df)
-
-        # 2. 特征对齐 (Poly filter)
-        Z_input2 = pd.concat([Z_input[non_poly_cols], Z_input[poly_no_inter_cols]], axis=1)
-
-        # 3. 最终特征选择
-        X_input_final = Z_input2[final_cols]
-
-        # 4. 预测
+        # 2. 调用特征工程 (Raw -> Features)
+        # 这一步会自动计算 Asset_Score, Adult_Income_Efficiency 等
+        df_engineered = engineer_features(df_raw)
+        
+        # 3. 预处理 (Impute -> OHE -> Poly)
+        # 注意：ColumnTransformer 会忽略 DataFrame 中多余的列（raw columns），只取 transform 需要的列
+        Z_input = preprocess.transform(df_engineered)
+        
+        # 4. 选择特征 (Poly Filter)
+        Z_input_sel = pd.concat([
+            Z_input[non_poly_cols], 
+            Z_input[poly_pure_cols]
+        ], axis=1)
+        
+        # 5. 最终列对齐
+        X_final = Z_input_sel[final_cols]
+        
+        # 6. 预测
         if model_name == "Logistic Regression":
-            X_ready = scaler.transform(X_input_final)
-            proba = float(final_logit.predict_proba(X_ready)[0, 1])
+            X_sc = scaler.transform(X_final)
+            prob = lr_model.predict_proba(X_sc)[0, 1]
         else:
-            proba = float(final_rf.predict_proba(X_input_final)[0, 1])
-
-        thr = float(thr)
-        is_risk = proba >= thr
-        lbl = "HIGH RISK (Denied)" if is_risk else "LOW RISK (Approved)"
-        color = "#dc3545" if is_risk else "#28a745"
-
+            prob = rf_model.predict_proba(X_final)[0, 1]
+            
+        color = "red" if prob > 0.5 else "green"
         return html.Div([
-            html.Div(f"Model: {model_name} | Threshold: {thr}"),
-            html.Div(f"Risk Probability: {proba:.2%}", style={"fontSize": "24px", "marginTop": "10px"}),
-            html.Div(lbl, style={"color": color, "fontWeight": "bold", "fontSize": "30px", "marginTop": "5px"})
+            f"Risk Probability: {prob:.2%}", 
+            html.Br(),
+            html.Span("High Risk" if prob > 0.5 else "Low Risk", style={"color": color})
         ])
+        
     except Exception as e:
-        return html.Div(f"Prediction Error: {str(e)}", style={"color": "red"})
+        return f"Error: {str(e)}"
 
-
-# =========================================================
-# 7) 启动入口
-# =========================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8050"))
     app.run_server(host="0.0.0.0", port=port, debug=True)
